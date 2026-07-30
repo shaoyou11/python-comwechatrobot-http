@@ -12,3 +12,7 @@ wechatrobot/__pycache__/
 db/
 *.pyc
 docker*
+*.bak-*
+.pytest_cache/
+.coverage
+.venv/
