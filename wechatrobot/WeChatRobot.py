@@ -9,6 +9,7 @@ import time
 import requests
 
 from .Api import Api
+from .BridgeReceiptStore import BridgeReceiptStore
 from .Bus import EventBus
 
 Bus = EventBus()
@@ -113,6 +114,8 @@ class WeChatRobot:
         bridge_api_base: Optional[str] = None,
         pull_wait_ms: Optional[int] = None,
         pull_batch_size: Optional[int] = None,
+        receipt_db_path: Optional[str] = None,
+        consumer_id: Optional[str] = None,
     ):
         self.ip = ip
         self.port = port
@@ -148,6 +151,24 @@ class WeChatRobot:
             if pull_batch_size is not None
             else _env_int("WECHATROBOT_PULL_BATCH_SIZE", 50, minimum=1)
         )
+        self.consumer_id = (
+            consumer_id
+            or os.environ.get("WECHATROBOT_CONSUMER_ID", "efb")
+        ).strip()[:128] or "efb"
+        self.receipt_store = None
+        if self.configured_message_mode in ("bridge", "auto"):
+            receipt_path = (
+                receipt_db_path
+                or os.environ.get("WECHATROBOT_RECEIPT_DB", ":memory:")
+            )
+            self.receipt_store = BridgeReceiptStore(
+                receipt_path,
+                retention_seconds=_env_int(
+                    "WECHATROBOT_RECEIPT_RETENTION_SECONDS",
+                    7 * 24 * 60 * 60,
+                    minimum=1,
+                ),
+            )
 
         self._stop_event = threading.Event()
         self._server: Optional[_ThreadingTCPServer] = None
@@ -160,29 +181,59 @@ class WeChatRobot:
             return func
         return deco
 
-    def _receive_callback(self, msg: Dict[str, Any]) -> None:
+    def _receive_callback(self, msg: Dict[str, Any]):
         raw_type = msg.get("type")
         msg["type"] = MESSAGE_TYPES.get(raw_type, "unhandled{}".format(raw_type))
 
         message = str(msg.get("message") or "")
         sender = str(msg.get("sender") or "")
         if msg["type"] == "friendrequest":
-            Bus.emit("frdver_msg", msg)
+            return Bus.emit("frdver_msg", msg)
         elif msg["type"] == "card":
-            Bus.emit("card_msg", msg)
+            return Bus.emit("card_msg", msg)
         elif '<sysmsg type="revokemsg">' in message:
-            Bus.emit("revoke_msg", msg)
+            return Bus.emit("revoke_msg", msg)
         elif "微信转账" in message and "<paysubtype>1</paysubtype>" in message:
-            Bus.emit("transfer_msg", msg)
+            return Bus.emit("transfer_msg", msg)
         elif msg.get("isSendMsg") == 1:
             if msg.get("isSendByPhone") == 1:
-                Bus.emit("self_msg", msg)
+                return Bus.emit("self_msg", msg)
             else:
-                Bus.emit("sent_msg", msg)
+                return Bus.emit("sent_msg", msg)
         elif "chatroom" in sender:
-            Bus.emit("group_msg", msg)
+            return Bus.emit("group_msg", msg)
         else:
-            Bus.emit("friend_msg", msg)
+            return Bus.emit("friend_msg", msg)
+
+    def _post_delivery_outcome(
+        self,
+        endpoint: str,
+        delivery_ids,
+        reason: str = "",
+    ) -> bool:
+        if not delivery_ids:
+            return True
+        body = {
+            "delivery_ids": list(delivery_ids),
+            "consumer_id": self.consumer_id,
+        }
+        if endpoint == "nack":
+            body["reason"] = reason
+        try:
+            response = requests.post(
+                "{}/v1/messages/{}".format(self.bridge_api_base, endpoint),
+                json=body,
+                timeout=(3, 5),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            count = payload.get("acked" if endpoint == "ack" else "nacked")
+            if not isinstance(count, int) or count < len(delivery_ids):
+                raise ValueError("bridge outcome count mismatch")
+            return True
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            logger.warning("Bridge %s failed: %s", endpoint.upper(), exc)
+            return False
 
     def _pull_once(
         self,
@@ -198,6 +249,8 @@ class WeChatRobot:
                 json={
                     "max_items": self.pull_batch_size,
                     "wait_ms": effective_wait_ms,
+                    "ack_mode": True,
+                    "consumer_id": self.consumer_id,
                 },
                 timeout=timeout,
             )
@@ -208,20 +261,62 @@ class WeChatRobot:
             messages = payload.get("messages", [])
             if not isinstance(messages, list):
                 raise ValueError("bridge response messages must be a list")
+            deliveries = payload.get("deliveries")
+            if deliveries is not None:
+                if not isinstance(deliveries, list) or len(deliveries) != len(messages):
+                    raise ValueError("bridge response deliveries must align with messages")
         except (requests.RequestException, ValueError, TypeError) as exc:
             if log_failure:
                 logger.warning("Bridge pull failed: %s", exc)
             return False
 
-        for msg in messages:
+        if deliveries is None:
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    logger.warning("Ignored non-object bridge message")
+                    continue
+                try:
+                    self._receive_callback(msg)
+                except Exception:
+                    logger.exception("Bridge message dispatch failed")
+            return True
+
+        ack_ids = []
+        nack_ids = []
+        for msg, delivery in zip(messages, deliveries):
             if not isinstance(msg, dict):
                 logger.warning("Ignored non-object bridge message")
                 continue
+            if not isinstance(delivery, dict):
+                logger.warning("Ignored bridge message with invalid delivery metadata")
+                continue
+            delivery_id = delivery.get("delivery_id")
+            dedup_key = delivery.get("dedup_key")
+            if not isinstance(delivery_id, str) or not delivery_id:
+                logger.warning("Ignored bridge message without delivery ID")
+                continue
+            if not isinstance(dedup_key, str) or not dedup_key:
+                logger.warning("Ignored bridge message without dedup key")
+                nack_ids.append(delivery_id)
+                continue
             try:
-                self._receive_callback(msg)
-            except Exception:
+                if self.receipt_store is None or not self.receipt_store.is_processed(dedup_key):
+                    self._receive_callback(msg)
+                    if self.receipt_store is not None:
+                        self.receipt_store.record_processed(dedup_key)
+                ack_ids.append(delivery_id)
+            except Exception as exc:
                 logger.exception("Bridge message dispatch failed")
-        return True
+                nack_ids.append(delivery_id)
+                failure_reason = type(exc).__name__
+
+        ack_ok = self._post_delivery_outcome("ack", ack_ids)
+        nack_ok = self._post_delivery_outcome(
+            "nack",
+            nack_ids,
+            reason=locals().get("failure_reason", "dispatch failed"),
+        )
+        return ack_ok and nack_ok
 
     def _select_message_mode(self) -> str:
         if self.configured_message_mode != "auto":
@@ -325,6 +420,9 @@ class WeChatRobot:
         ):
             run_thread.join(timeout=5)
         self._run_thread = None
+        if self.receipt_store is not None:
+            self.receipt_store.close()
+            self.receipt_store = None
 
     def get_base_path(self):
         return self.BASE_PATH

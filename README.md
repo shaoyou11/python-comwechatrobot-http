@@ -75,6 +75,8 @@ environment:
   WECHATROBOT_BRIDGE_API_BASE: http://127.0.0.1:19088
   WECHATROBOT_PULL_WAIT_MS: "15000"
   WECHATROBOT_PULL_BATCH_SIZE: "50"
+  WECHATROBOT_CONSUMER_ID: efb
+  WECHATROBOT_RECEIPT_DB: /data/operations/state/bridge-consumer.db
 ```
 
 也可以通过构造参数设置：
@@ -89,7 +91,7 @@ bot = WeChatRobot(
 
 ## EFB 兼容说明
 
-当前 EFB 镜像建议先保持：
+旧 ComWechat 后端可保持：
 
 ```yaml
 environment:
@@ -100,9 +102,12 @@ environment:
 接口。公众号过滤、Watchdog、附件处理等上层定制功能不在本库中实现，因此升级
 本库不会主动删除或重写这些功能。
 
-只有后端真正提供 `POST /v1/messages/pull` 时，才应切换到 `bridge`。本项目是
-消息消费者，不会自行创建、持久化或确认 Bridge 队列；队列可靠性由 Bridge
-服务负责。
+只有后端提供可靠版 `POST /v1/messages/pull` 时，才应切换到 `bridge`。可靠模式
+会请求租约元数据，消息分发成功后调用 ACK，失败时调用 NACK。消费成功去重键写入
+本地 SQLite 回执数据库；如果 ACK 请求丢失，消息再次投递时只补 ACK，不重复分发。
+
+生产环境必须把 `WECHATROBOT_RECEIPT_DB` 指向持久化目录。未配置时使用内存回执，
+仅适合开发测试。旧 Bridge 响应不包含租约元数据时仍可兼容消费，但没有 ACK 保障。
 
 ## 自动模式边界
 
@@ -122,6 +127,9 @@ environment:
 | `WECHATROBOT_BRIDGE_API_BASE` | `http://127.0.0.1:19088` | Bridge API 根地址 |
 | `WECHATROBOT_PULL_WAIT_MS` | `15000` | 长轮询等待时间，毫秒 |
 | `WECHATROBOT_PULL_BATCH_SIZE` | `50` | 每批最多获取的消息数 |
+| `WECHATROBOT_CONSUMER_ID` | `efb` | Bridge 租约消费者名称 |
+| `WECHATROBOT_RECEIPT_DB` | `:memory:` | 成功消费回执 SQLite 路径 |
+| `WECHATROBOT_RECEIPT_RETENTION_SECONDS` | `604800` | 消费去重回执保留时间 |
 
 ## 事件
 
