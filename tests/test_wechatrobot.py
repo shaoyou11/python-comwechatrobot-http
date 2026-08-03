@@ -80,6 +80,16 @@ def test_openim_customer_service_lookup_uses_openim_database():
     assert "OpenIMContact" in calls[0][1]
 
 
+def test_openim_customer_service_lookup_returns_none_when_record_is_missing():
+    api = Api.__new__(Api)
+    api.GetDBHandle = lambda db_name="MicroMsg.db": db_name
+    api.QueryDatabase = lambda **kwargs: {
+        "data": [["UserName", "Alias", "Remark", "NickName", "Type"]]
+    }
+
+    assert api.GetContactBySql("25984993499793938@kefu.openim") is None
+
+
 def test_event_decorator_returns_original_function():
     robot = WeChatRobot()
 

@@ -242,7 +242,7 @@ class Api:
         else:
             sql = f"select UserName,'' as Alias,Remark,NickName,Type from OpenIMContact where UserName='{wxid}';" 
             result = self.QueryDatabase(db_handle=self.GetDBHandle("OpenIMContact.db"),sql=sql)
-        if len(result["data"]) > 0:
+        if len(result.get("data") or []) > 1:
             return result["data"][1]
         else:
             return None
