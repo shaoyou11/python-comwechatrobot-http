@@ -6,6 +6,7 @@ import time
 import pytest
 
 from wechatrobot import WeChatRobot
+from wechatrobot.Api import Api, is_openim_contact_id
 
 
 robot_module = importlib.import_module("wechatrobot.WeChatRobot")
@@ -53,6 +54,30 @@ def test_preserves_configurable_comwechat_port():
     robot = WeChatRobot(comwechat_port=19999)
 
     assert robot.api.port == 19999
+
+
+def test_openim_contact_id_detection_includes_customer_service_ids():
+    assert is_openim_contact_id("25984993499793938@kefu.openim")
+    assert is_openim_contact_id("some-user@openim")
+    assert not is_openim_contact_id("wxid_friend")
+
+
+def test_openim_customer_service_lookup_uses_openim_database():
+    api = Api.__new__(Api)
+    calls = []
+    api.GetDBHandle = lambda db_name="MicroMsg.db": db_name
+
+    def query_database(*, db_handle, sql):
+        calls.append((db_handle, sql))
+        return {"data": [["UserName", "Alias", "Remark", "NickName", "Type"],
+                          ["25984993499793938@kefu.openim", "", "", "国开客服", "3"]]}
+
+    api.QueryDatabase = query_database
+    result = api.GetContactBySql("25984993499793938@kefu.openim")
+
+    assert result[3] == "国开客服"
+    assert calls[0][0] == "OpenIMContact.db"
+    assert "OpenIMContact" in calls[0][1]
 
 
 def test_event_decorator_returns_original_function():

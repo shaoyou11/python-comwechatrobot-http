@@ -5,6 +5,14 @@ from .Modles import *
 import base64
 from wechatrobot import ChatRoomData_pb2 as ChatRoom
 
+
+OPENIM_CONTACT_SUFFIXES = ("@openim", "@kefu.openim")
+
+
+def is_openim_contact_id(wxid: str) -> bool:
+    return str(wxid or "").lower().endswith(OPENIM_CONTACT_SUFFIXES)
+
+
 class Api:
     def __init__(self, port = 18888):
         self.port = port
@@ -179,7 +187,7 @@ class Api:
         for index in range(1, len(OpenIMContactList)):
             wxid = OpenIMContactList[index][0]
             contact_data[wxid] = {}
-            contact_data[wxid]['alias'] = ContactList[index][1]
+            contact_data[wxid]['alias'] = OpenIMContactList[index][1]
             contact_data[wxid]['remark'] = OpenIMContactList[index][2]
             contact_data[wxid]['nickname'] = OpenIMContactList[index][3]
             contact_data[wxid]['type'] = OpenIMContactList[index][4]
@@ -212,7 +220,7 @@ class Api:
         return group_data
 
     def GetPictureBySql(self, wxid) -> Dict:
-        if not wxid.endswith("@openim"):
+        if not is_openim_contact_id(wxid):
             sql = f"select usrName,smallHeadImgUrl,bigHeadImgUrl from ContactHeadImgUrl where usrName='{wxid}';" 
             result = self.QueryDatabase(db_handle=self.GetDBHandle(),sql=sql)
         else:
@@ -228,7 +236,7 @@ class Api:
             return None
 
     def GetContactBySql(self, wxid):
-        if not wxid.endswith("@openim"):
+        if not is_openim_contact_id(wxid):
             sql = f"select UserName,Alias,Remark,NickName,Type from Contact where UserName='{wxid}';" 
             result = self.QueryDatabase(db_handle=self.GetDBHandle(),sql=sql)
         else:
