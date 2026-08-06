@@ -187,23 +187,29 @@ class WeChatRobot:
 
         message = str(msg.get("message") or "")
         sender = str(msg.get("sender") or "")
+
+        def emit_required(event: str):
+            if not Bus.has_subscribers(event):
+                raise RuntimeError("No handler subscribed for {}".format(event))
+            return Bus.emit(event, msg)
+
         if msg["type"] == "friendrequest":
-            return Bus.emit("frdver_msg", msg)
+            return emit_required("frdver_msg")
         elif msg["type"] == "card":
-            return Bus.emit("card_msg", msg)
+            return emit_required("card_msg")
         elif '<sysmsg type="revokemsg">' in message:
-            return Bus.emit("revoke_msg", msg)
+            return emit_required("revoke_msg")
         elif "微信转账" in message and "<paysubtype>1</paysubtype>" in message:
-            return Bus.emit("transfer_msg", msg)
+            return emit_required("transfer_msg")
         elif msg.get("isSendMsg") == 1:
             if msg.get("isSendByPhone") == 1:
-                return Bus.emit("self_msg", msg)
+                return emit_required("self_msg")
             else:
-                return Bus.emit("sent_msg", msg)
+                return emit_required("sent_msg")
         elif "chatroom" in sender:
-            return Bus.emit("group_msg", msg)
+            return emit_required("group_msg")
         else:
-            return Bus.emit("friend_msg", msg)
+            return emit_required("friend_msg")
 
     def _post_delivery_outcome(
         self,
