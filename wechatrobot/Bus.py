@@ -8,6 +8,9 @@ class EventBus:
     def subscribe(self, event: str, func: Callable) -> None:
         self._subscribers[event].add(func)
 
+    def has_subscribers(self, event: str) -> bool:
+        return bool(self._subscribers.get(event))
+
     def emit(self, event: str, *args, **kwargs) -> List[Any]:
         results = []
         for f in self._subscribers[event]:
