@@ -152,7 +152,7 @@ class WeChatRobot:
         self.pull_batch_size = (
             pull_batch_size
             if pull_batch_size is not None
-            else _env_int("WECHATROBOT_PULL_BATCH_SIZE", 50, minimum=1)
+            else _env_int("WECHATROBOT_PULL_BATCH_SIZE", 5, minimum=1)
         )
         self.consumer_id = (
             consumer_id

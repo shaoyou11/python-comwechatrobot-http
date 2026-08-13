@@ -154,6 +154,14 @@ def test_bridge_pull_dispatches_all_messages(monkeypatch, tmp_path):
     assert emitted == ["friend_msg", "group_msg"]
 
 
+def test_bridge_default_pull_batch_is_bounded(monkeypatch):
+    monkeypatch.delenv("WECHATROBOT_PULL_BATCH_SIZE", raising=False)
+
+    robot = WeChatRobot(message_mode="bridge")
+
+    assert robot.pull_batch_size == 5
+
+
 def test_reliable_bridge_acks_after_dispatch(monkeypatch, tmp_path):
     calls = []
     emitted = []
