@@ -1,6 +1,7 @@
 import importlib
 import json
 import socket
+import threading
 import time
 
 import pytest
@@ -192,6 +193,98 @@ def test_reliable_bridge_acks_after_dispatch(monkeypatch, tmp_path):
         "http://bridge:19088/v1/messages/ack",
         {"delivery_ids": ["lease-1"], "consumer_id": "efb"},
     )
+
+
+def test_bridge_dispatches_different_chats_concurrently(monkeypatch, tmp_path):
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    messages = [
+        message(msgid="contact-a", sender="wxid_a"),
+        message(msgid="contact-b", sender="wxid_b"),
+    ]
+    deliveries = [
+        {"delivery_id": "lease-a", "dedup_key": "msg:contact-a"},
+        {"delivery_id": "lease-b", "dedup_key": "msg:contact-b"},
+    ]
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.body
+
+    def fake_post(url, json, timeout):
+        if url.endswith("/pull"):
+            return Response({"messages": messages, "deliveries": deliveries})
+        return Response({"ok": True, "acked": len(json["delivery_ids"])})
+
+    def emit(_event, _msg):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(robot_module.requests, "post", fake_post)
+    monkeypatch.setattr(robot_module.Bus, "emit", emit)
+    robot = WeChatRobot(
+        message_mode="bridge",
+        receipt_db_path=str(tmp_path / "receipts.db"),
+        dispatch_workers=2,
+    )
+
+    assert robot._pull_once(wait_ms=0) is True
+    assert peak == 2
+
+
+def test_bridge_keeps_same_chat_fifo(monkeypatch, tmp_path):
+    seen = []
+    messages = [
+        message(msgid="first", sender="room@chatroom"),
+        message(msgid="second", sender="room@chatroom"),
+    ]
+    deliveries = [
+        {"delivery_id": "lease-1", "dedup_key": "msg:first"},
+        {"delivery_id": "lease-2", "dedup_key": "msg:second"},
+    ]
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.body
+
+    def fake_post(url, json, timeout):
+        if url.endswith("/pull"):
+            return Response({"messages": messages, "deliveries": deliveries})
+        return Response({"ok": True, "acked": len(json["delivery_ids"])})
+
+    monkeypatch.setattr(robot_module.requests, "post", fake_post)
+    monkeypatch.setattr(
+        robot_module.Bus,
+        "emit",
+        lambda _event, msg: seen.append(msg["msgid"]),
+    )
+    robot = WeChatRobot(
+        message_mode="bridge",
+        receipt_db_path=str(tmp_path / "receipts.db"),
+        dispatch_workers=2,
+    )
+
+    assert robot._pull_once(wait_ms=0) is True
+    assert seen == ["first", "second"]
 
 
 def test_reliable_bridge_nacks_dispatch_failure(monkeypatch, tmp_path):

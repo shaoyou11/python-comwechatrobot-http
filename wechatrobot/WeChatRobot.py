@@ -1,4 +1,6 @@
 from typing import Any, Callable, Dict, Optional, Tuple
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -116,6 +118,7 @@ class WeChatRobot:
         pull_batch_size: Optional[int] = None,
         receipt_db_path: Optional[str] = None,
         consumer_id: Optional[str] = None,
+        dispatch_workers: Optional[int] = None,
     ):
         self.ip = ip
         self.port = port
@@ -155,6 +158,12 @@ class WeChatRobot:
             consumer_id
             or os.environ.get("WECHATROBOT_CONSUMER_ID", "efb")
         ).strip()[:128] or "efb"
+        self.dispatch_workers = min(
+            16,
+            dispatch_workers
+            if dispatch_workers is not None
+            else _env_int("WECHATROBOT_DISPATCH_WORKERS", 4, minimum=1),
+        )
         self.receipt_store = None
         if self.configured_message_mode in ("bridge", "auto"):
             receipt_path = (
@@ -210,6 +219,35 @@ class WeChatRobot:
             return emit_required("group_msg")
         else:
             return emit_required("friend_msg")
+
+    @staticmethod
+    def _source_chat_key(msg: Dict[str, Any]) -> str:
+        for key in (
+            "chat_id", "chatId", "conversation_id", "conversationId",
+            "roomid", "room_id", "group_id", "chatroom_id",
+            "from_user", "fromUser", "sender", "wxid", "chat",
+        ):
+            value = str(msg.get(key) or "").strip()
+            if value:
+                return value
+        return "unknown"
+
+    def _dispatch_delivery_group(self, items):
+        ack_ids = []
+        nack_ids = []
+        failure_reasons = []
+        for msg, delivery_id, dedup_key in items:
+            try:
+                if self.receipt_store is None or not self.receipt_store.is_processed(dedup_key):
+                    self._receive_callback(msg)
+                    if self.receipt_store is not None:
+                        self.receipt_store.record_processed(dedup_key)
+                ack_ids.append(delivery_id)
+            except Exception as exc:
+                logger.exception("Bridge message dispatch failed")
+                nack_ids.append(delivery_id)
+                failure_reasons.append(type(exc).__name__)
+        return ack_ids, nack_ids, failure_reasons
 
     def _post_delivery_outcome(
         self,
@@ -289,6 +327,7 @@ class WeChatRobot:
 
         ack_ids = []
         nack_ids = []
+        grouped = OrderedDict()
         for msg, delivery in zip(messages, deliveries):
             if not isinstance(msg, dict):
                 logger.warning("Ignored non-object bridge message")
@@ -305,22 +344,34 @@ class WeChatRobot:
                 logger.warning("Ignored bridge message without dedup key")
                 nack_ids.append(delivery_id)
                 continue
-            try:
-                if self.receipt_store is None or not self.receipt_store.is_processed(dedup_key):
-                    self._receive_callback(msg)
-                    if self.receipt_store is not None:
-                        self.receipt_store.record_processed(dedup_key)
-                ack_ids.append(delivery_id)
-            except Exception as exc:
-                logger.exception("Bridge message dispatch failed")
-                nack_ids.append(delivery_id)
-                failure_reason = type(exc).__name__
+            trace_id = str(delivery.get("trace_id") or "").strip()
+            if trace_id:
+                msg["_bridge_trace_id"] = trace_id[:12]
+            grouped.setdefault(self._source_chat_key(msg), []).append(
+                (msg, delivery_id, dedup_key)
+            )
+
+        failure_reasons = []
+        if grouped:
+            with ThreadPoolExecutor(
+                max_workers=min(self.dispatch_workers, len(grouped)),
+                thread_name_prefix="wechatrobot-chat",
+            ) as executor:
+                futures = [
+                    executor.submit(self._dispatch_delivery_group, items)
+                    for items in grouped.values()
+                ]
+                for future in futures:
+                    group_acked, group_nacked, group_reasons = future.result()
+                    ack_ids.extend(group_acked)
+                    nack_ids.extend(group_nacked)
+                    failure_reasons.extend(group_reasons)
 
         ack_ok = self._post_delivery_outcome("ack", ack_ids)
         nack_ok = self._post_delivery_outcome(
             "nack",
             nack_ids,
-            reason=locals().get("failure_reason", "dispatch failed"),
+            reason=failure_reasons[0] if failure_reasons else "dispatch failed",
         )
         return ack_ok and nack_ok
 
