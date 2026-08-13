@@ -1,6 +1,7 @@
 import importlib
 import json
 import socket
+import threading
 import time
 
 import pytest
@@ -22,6 +23,11 @@ def message(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+@pytest.fixture(autouse=True)
+def pretend_event_handlers_are_ready(monkeypatch):
+    monkeypatch.setattr(robot_module.Bus, "has_subscribers", lambda _event: True)
 
 
 @pytest.mark.parametrize(
@@ -189,6 +195,98 @@ def test_reliable_bridge_acks_after_dispatch(monkeypatch, tmp_path):
     )
 
 
+def test_bridge_dispatches_different_chats_concurrently(monkeypatch, tmp_path):
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    messages = [
+        message(msgid="contact-a", sender="wxid_a"),
+        message(msgid="contact-b", sender="wxid_b"),
+    ]
+    deliveries = [
+        {"delivery_id": "lease-a", "dedup_key": "msg:contact-a"},
+        {"delivery_id": "lease-b", "dedup_key": "msg:contact-b"},
+    ]
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.body
+
+    def fake_post(url, json, timeout):
+        if url.endswith("/pull"):
+            return Response({"messages": messages, "deliveries": deliveries})
+        return Response({"ok": True, "acked": len(json["delivery_ids"])})
+
+    def emit(_event, _msg):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr(robot_module.requests, "post", fake_post)
+    monkeypatch.setattr(robot_module.Bus, "emit", emit)
+    robot = WeChatRobot(
+        message_mode="bridge",
+        receipt_db_path=str(tmp_path / "receipts.db"),
+        dispatch_workers=2,
+    )
+
+    assert robot._pull_once(wait_ms=0) is True
+    assert peak == 2
+
+
+def test_bridge_keeps_same_chat_fifo(monkeypatch, tmp_path):
+    seen = []
+    messages = [
+        message(msgid="first", sender="room@chatroom"),
+        message(msgid="second", sender="room@chatroom"),
+    ]
+    deliveries = [
+        {"delivery_id": "lease-1", "dedup_key": "msg:first"},
+        {"delivery_id": "lease-2", "dedup_key": "msg:second"},
+    ]
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.body
+
+    def fake_post(url, json, timeout):
+        if url.endswith("/pull"):
+            return Response({"messages": messages, "deliveries": deliveries})
+        return Response({"ok": True, "acked": len(json["delivery_ids"])})
+
+    monkeypatch.setattr(robot_module.requests, "post", fake_post)
+    monkeypatch.setattr(
+        robot_module.Bus,
+        "emit",
+        lambda _event, msg: seen.append(msg["msgid"]),
+    )
+    robot = WeChatRobot(
+        message_mode="bridge",
+        receipt_db_path=str(tmp_path / "receipts.db"),
+        dispatch_workers=2,
+    )
+
+    assert robot._pull_once(wait_ms=0) is True
+    assert seen == ["first", "second"]
+
+
 def test_reliable_bridge_nacks_dispatch_failure(monkeypatch, tmp_path):
     calls = []
     delivery = {"delivery_id": "lease-2", "dedup_key": "msg:200"}
@@ -229,6 +327,42 @@ def test_reliable_bridge_nacks_dispatch_failure(monkeypatch, tmp_path):
     assert robot._pull_once(wait_ms=0) is True
     assert calls[1][0] == "http://bridge:19088/v1/messages/nack"
     assert calls[1][1]["delivery_ids"] == ["lease-2"]
+    assert calls[1][1]["reason"] == "RuntimeError"
+
+
+def test_reliable_bridge_nacks_until_event_handler_is_ready(monkeypatch, tmp_path):
+    calls = []
+    delivery = {"delivery_id": "lease-not-ready", "dedup_key": "msg:not-ready"}
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.body
+
+    def fake_post(url, json, timeout):
+        calls.append((url, json))
+        if url.endswith("/pull"):
+            return Response(
+                {"messages": [message(msgid="not-ready")], "deliveries": [delivery]}
+            )
+        return Response({"ok": True, "nacked": 1})
+
+    monkeypatch.setattr(robot_module.requests, "post", fake_post)
+    monkeypatch.setattr(robot_module.Bus, "has_subscribers", lambda _event: False)
+    robot = WeChatRobot(
+        message_mode="bridge",
+        bridge_api_base="http://bridge:19088",
+        receipt_db_path=str(tmp_path / "receipts.db"),
+    )
+
+    assert robot._pull_once(wait_ms=0) is True
+    assert calls[1][0] == "http://bridge:19088/v1/messages/nack"
+    assert calls[1][1]["delivery_ids"] == ["lease-not-ready"]
     assert calls[1][1]["reason"] == "RuntimeError"
 
 
