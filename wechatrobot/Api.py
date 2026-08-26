@@ -1,6 +1,8 @@
 from typing import Callable, Any, Union, Awaitable , Optional , Dict
 import requests
 import json
+import os
+import threading
 from .Modles import *
 import base64
 from wechatrobot import ChatRoomData_pb2 as ChatRoom
@@ -14,9 +16,48 @@ def is_openim_contact_id(wxid: str) -> bool:
 
 
 class Api:
-    def __init__(self, port = 18888):
-        self.port = port
-        self.db_handle : Dict[str, int] = 0
+    DB_HANDLE_ERRORS = {"database handle unavailable", "database query failed"}
+    port: int = 18888
+    db_handle: Dict[str, int] = 0
+    request_timeout = None
+
+    def __init__(self, port: int = 18888):
+        self.port = self._get_port(port)
+        self.api_base = self._get_api_base(self.port)
+        self.db_handle = {}
+        self._db_handle_lock = threading.Lock()
+        self.request_timeout = self._env_float("WECHATROBOT_API_TIMEOUT", 5.0)
+        self.send_timeout = self._env_float("WECHATROBOT_SEND_API_TIMEOUT", 60.0)
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        try:
+            parsed = float(value)
+        except ValueError:
+            return default
+        return parsed if parsed > 0 else default
+
+    def _get_port(self, default_port: int) -> int:
+        value = os.environ.get("WECHATROBOT_API_PORT")
+        if value is None:
+            return default_port
+        try:
+            return int(value)
+        except ValueError:
+            return default_port
+
+    def _get_api_base(self, port: int) -> str:
+        base = os.environ.get("WECHATROBOT_API_BASE")
+        if base:
+            return base.rstrip("/")
+        host = os.environ.get("WECHATROBOT_API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        return f"http://{host}:{port}"
+
+    def _api_url(self, api_type: int) -> str:
+        return f"{self.api_base}/api/?type={api_type}"
 
     def IsLoginIn(self , **params) -> Dict:
         return self.post(WECHAT_IS_LOGIN , IsLoginBody(**params))
@@ -25,25 +66,25 @@ class Api:
         return self.post(WECHAT_GET_SELF_INFO , GetSelfInfoBody(**params))
 
     def SendText(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_TEXT , SendTextBody(**params))
+        return self.post(WECHAT_MSG_SEND_TEXT , SendTextBody(**params), timeout=self.send_timeout)
 
     def SendAt(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_AT , SendAtBody(**params))
+        return self.post(WECHAT_MSG_SEND_AT , SendAtBody(**params), timeout=self.send_timeout)
 
     def SendCard(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_CARD , SendCardBody(**params))
+        return self.post(WECHAT_MSG_SEND_CARD , SendCardBody(**params), timeout=self.send_timeout)
 
     def SendImage(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_IMAGE , SendImageBody(**params))
+        return self.post(WECHAT_MSG_SEND_IMAGE , SendImageBody(**params), timeout=self.send_timeout)
 
     def SendFile(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_FILE , SendFileBody(**params))
+        return self.post(WECHAT_MSG_SEND_FILE , SendFileBody(**params), timeout=self.send_timeout)
     
     def SendArticle(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_ARTICLE , SendArticleBody(**params))
+        return self.post(WECHAT_MSG_SEND_ARTICLE , SendArticleBody(**params), timeout=self.send_timeout)
 
     def SendApp(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_APP , SendAppBody(**params))
+        return self.post(WECHAT_MSG_SEND_APP , SendAppBody(**params), timeout=self.send_timeout)
 
     def StartMsgHook(self, **params) -> Dict:
         return self.post(WECHAT_MSG_START_HOOK , StartMsgHookBody(**params))
@@ -121,7 +162,45 @@ class Api:
         return self.post(WECHAT_DATABASE_BACKUP , BackupDatabaseBody(**params))
 
     def QueryDatabase(self , **params) -> Dict:
-        return self.post(WECHAT_DATABASE_QUERY , QueryDatabaseBody(**params))
+        db_name = params.pop("db_name", None)
+        db_handle = params.get("db_handle")
+        if db_name is None:
+            with self._db_handle_lock:
+                db_name = next(
+                    (
+                        name
+                        for name, handle in self.db_handle.items()
+                        if str(handle) == str(db_handle)
+                    ),
+                    None,
+                )
+
+        if db_name and not params.get("db_handle"):
+            params["db_handle"] = self.GetDBHandle(db_name)
+
+        response = self.post(WECHAT_DATABASE_QUERY , QueryDatabaseBody(**params))
+        if not isinstance(response, dict) or response.get("err_msg") not in self.DB_HANDLE_ERRORS:
+            return response
+
+        self.invalidate_db_handles()
+        if not db_name:
+            return response
+
+        fresh_handle = self.GetDBHandle(db_name)
+        if not fresh_handle:
+            return response
+
+        params["db_handle"] = fresh_handle
+        retry = self.post(WECHAT_DATABASE_QUERY , QueryDatabaseBody(**params))
+        if isinstance(retry, dict) and retry.get("err_msg") in self.DB_HANDLE_ERRORS:
+            self.invalidate_db_handles()
+        return retry
+
+    def InvalidateDatabaseHandles(self , **params) -> Dict:
+        return self.post(
+            WECHAT_DATABASE_INVALIDATE_HANDLES,
+            InvalidateDatabaseHandlesBody(**params),
+        )
 
     def SetVersion(self , **params) -> Dict:
         return self.post(WECHAT_SET_VERSION , SetVersionBody(**params))
@@ -139,17 +218,25 @@ class Api:
         return self.post(WECHAT_GET_PUBLIC_MSG , GetPublicMsgBody(**params))
 
     def ForwardMessage(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_FORWARD_MESSAGE , ForwardMessageBody(**params))
+        return self.post(
+            WECHAT_MSG_FORWARD_MESSAGE,
+            ForwardMessageBody(**params),
+            timeout=self.send_timeout,
+        )
 
     def GetQrcodeImage(self , **params):
-        r = requests.post( f"http://127.0.0.1:{self.port}/api/?type={WECHAT_GET_QRCODE_IMAGE}", data = GetQrcodeImageBody(**params).json())
+        r = requests.post(
+            self._api_url(WECHAT_GET_QRCODE_IMAGE),
+            data=GetQrcodeImageBody(**params).json(),
+            timeout=self.request_timeout,
+        )
         return r.content
 
     def GetA8Key(self , **params) -> Dict:
         return self.post(WECHAT_GET_A8KEY , GetA8KeyBody(**params))
 
     def SendXml(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_XML , SendXmlBody(**params))
+        return self.post(WECHAT_MSG_SEND_XML , SendXmlBody(**params), timeout=self.send_timeout)
 
     def LogOut(self , **params) -> Dict:
         return self.post(WECHAT_LOGOUT , LogOutBody(**params))
@@ -158,21 +245,46 @@ class Api:
         return self.post(WECHAT_GET_TRANSFER , GetTransferBody(**params))
 
     def SendEmotion(self , **params) -> Dict:
-        return self.post(WECHAT_MSG_SEND_EMOTION , SendEmotionBody(**params))
+        return self.post(
+            WECHAT_MSG_SEND_EMOTION,
+            SendEmotionBody(**params),
+            timeout=self.send_timeout,
+        )
 
     def GetCdn(self , **params) -> Dict:
         return self.post(WECHAT_GET_CDN , GetCdnBody(**params))
 
-    #[自定义
-    def GetDBHandle(self, db_name="MicroMsg.db") -> int:
-        if not self.db_handle:
-            self.db_handle = {i["db_name"]: i["handle"] for i in self.GetDatabaseHandles()["data"]}
+    def MarkAsRead(self , **params) -> Dict:
+        return self.post(WECHAT_MSG_MARK_AS_READ , MarkAsReadBody(**params))
 
-        return self.db_handle[db_name]
+    #[自定义
+    def invalidate_db_handles(self) -> None:
+        with self._db_handle_lock:
+            self.db_handle.clear()
+        try:
+            self.InvalidateDatabaseHandles()
+        except Exception:
+            pass
+
+    def GetDBHandle(self, db_name="MicroMsg.db") -> int:
+        with self._db_handle_lock:
+            cached = self.db_handle.get(db_name)
+        if cached:
+            return cached
+
+        handles = self.GetDatabaseHandles().get("data", [])
+        refreshed = {
+            item["db_name"]: item["handle"]
+            for item in handles
+            if isinstance(item, dict) and item.get("db_name") and item.get("handle")
+        }
+        with self._db_handle_lock:
+            self.db_handle.update(refreshed)
+            return self.db_handle.get(db_name, 0)
 
     def GetContactListBySql(self) -> Dict:
         sql = "select UserName,Alias,Remark,NickName,Type from Contact"   #  where type!=4 and type!=0;
-        ContactList = self.QueryDatabase(db_handle=self.GetDBHandle(), sql=sql)["data"]
+        ContactList = self.QueryDatabase(db_name="MicroMsg.db", sql=sql)["data"]
         contact_data = {}         # {wxid : {alias, remark, nickname , type}}
         for index in range(1, len(ContactList)):
             wxid = ContactList[index][0]
@@ -183,7 +295,9 @@ class Api:
             contact_data[wxid]['type'] = ContactList[index][4]
 
         sql = "select UserName,'' as Alias,Remark,NickName,Type from OpenIMContact"   #  where type!=4 and type!=0;
-        OpenIMContactList = self.QueryDatabase(db_handle=self.GetDBHandle("OpenIMContact.db"), sql=sql)["data"]
+        OpenIMContactList = self.QueryDatabase(
+            db_name="OpenIMContact.db", sql=sql
+        )["data"]
         for index in range(1, len(OpenIMContactList)):
             wxid = OpenIMContactList[index][0]
             contact_data[wxid] = {}
@@ -196,7 +310,9 @@ class Api:
     def GetGroupMembersBySql(self, room_id) -> Dict:
         group_data = {} #{ "wxID" : "displayName"}
         sql = "select RoomData from ChatRoom where ChatRoomName = '" + room_id + "' ;"
-        data = self.QueryDatabase(db_handle=self.GetDBHandle(), sql = sql)['data']
+        data = self.QueryDatabase(
+            db_name="MicroMsg.db", sql=sql
+        )["data"]
         chatroom = ChatRoom.ChatRoomData()
         group_member = {}
         chatroom.ParseFromString(bytes(base64.b64decode(data[1][0])))
@@ -208,7 +324,9 @@ class Api:
     def GetAllGroupMembersBySql(self) -> Dict:
         group_data = {} #{"group_id" : { "wxID" : "displayName"}}
         sql = "select ChatRoomName,RoomData from ChatRoom"
-        GroupMemberList = self.QueryDatabase(db_handle=self.GetDBHandle(), sql = sql)['data']
+        GroupMemberList = self.QueryDatabase(
+            db_name="MicroMsg.db", sql=sql
+        )["data"]
         chatroom = ChatRoom.ChatRoomData()
         for index in range(1 , len(GroupMemberList)):
             group_member = {}
@@ -222,10 +340,10 @@ class Api:
     def GetPictureBySql(self, wxid) -> Dict:
         if not is_openim_contact_id(wxid):
             sql = f"select usrName,smallHeadImgUrl,bigHeadImgUrl from ContactHeadImgUrl where usrName='{wxid}';" 
-            result = self.QueryDatabase(db_handle=self.GetDBHandle(),sql=sql)
+            result = self.QueryDatabase(db_name="MicroMsg.db", sql=sql)
         else:
             sql = f"select UserName,SmallHeadImgUrl,BigHeadImgUrl from OpenIMContact where UserName='{wxid}';" 
-            result = self.QueryDatabase(db_handle=self.GetDBHandle("OpenIMContact.db"),sql=sql)
+            result = self.QueryDatabase(db_name="OpenIMContact.db", sql=sql)
         try:
             if result["data"][1][2] != "":
                 return result["data"][1][2]
@@ -238,18 +356,23 @@ class Api:
     def GetContactBySql(self, wxid):
         if not is_openim_contact_id(wxid):
             sql = f"select UserName,Alias,Remark,NickName,Type from Contact where UserName='{wxid}';" 
-            result = self.QueryDatabase(db_handle=self.GetDBHandle(),sql=sql)
+            result = self.QueryDatabase(db_name="MicroMsg.db", sql=sql)
         else:
             sql = f"select UserName,'' as Alias,Remark,NickName,Type from OpenIMContact where UserName='{wxid}';" 
-            result = self.QueryDatabase(db_handle=self.GetDBHandle("OpenIMContact.db"),sql=sql)
+            result = self.QueryDatabase(db_name="OpenIMContact.db", sql=sql)
         if len(result.get("data") or []) > 1:
             return result["data"][1]
         else:
             return None
     #自定义]
 
-    def post(self , type : int, params : Body) -> Dict:
-        return json.loads(requests.post( f"http://127.0.0.1:{self.port}/api/?type={type}", data = params.json()).content.decode("utf-8"),strict=False)
+    def post(self , type : int, params : Body, timeout: Optional[float] = None) -> Dict:
+        response = requests.post(
+            self._api_url(type),
+            data=params.json(),
+            timeout=self.request_timeout if timeout is None else timeout,
+        )
+        return json.loads(response.content.decode("utf-8"), strict=False)
 
     def exec_command(self , item: str) -> Callable:
         return eval(f"self.{item}")
