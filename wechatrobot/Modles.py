@@ -68,6 +68,8 @@ WECHAT_LOGOUT = 44                          # 退出登录
 WECHAT_GET_TRANSFER = 45                    # 收款
 WECHAT_MSG_SEND_EMOTION = 46                # 发送表情
 WECHAT_GET_CDN = 47                         # 下载文件、视频、图片
+WECHAT_DATABASE_INVALIDATE_HANDLES = 48     # 清空原生数据库句柄缓存
+WECHAT_MSG_MARK_AS_READ = 49                # 标记会话已读
 
 # Body
 
@@ -211,6 +213,12 @@ class BackupDatabaseBody(Body):
 class QueryDatabaseBody(Body):
     db_handle : str
     sql       : str
+
+class InvalidateDatabaseHandlesBody(Body):
+    ...
+
+class MarkAsReadBody(Body):
+    wxid: str
 
 #version
 class SetVersionBody(Body):

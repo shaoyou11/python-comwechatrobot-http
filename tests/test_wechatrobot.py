@@ -72,8 +72,8 @@ def test_openim_customer_service_lookup_uses_openim_database():
     calls = []
     api.GetDBHandle = lambda db_name="MicroMsg.db": db_name
 
-    def query_database(*, db_handle, sql):
-        calls.append((db_handle, sql))
+    def query_database(*, db_name, sql):
+        calls.append((db_name, sql))
         return {"data": [["UserName", "Alias", "Remark", "NickName", "Type"],
                           ["25984993499793938@kefu.openim", "", "", "国开客服", "3"]]}
 

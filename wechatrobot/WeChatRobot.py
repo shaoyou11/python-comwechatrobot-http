@@ -1,4 +1,5 @@
 from typing import Any, Callable, Dict, Optional, Tuple
+from collections import deque
 import json
 import logging
 import os
@@ -58,6 +59,18 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
         logger.warning("Environment variable %s is below %s; using %s", name, minimum, default)
         return default
     return parsed
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Invalid float environment variable %s; using %s", name, default)
+        return default
+    return parsed if parsed > 0 else default
 
 
 class _ThreadingTCPServer(socketserver.ThreadingTCPServer):
@@ -173,6 +186,15 @@ class WeChatRobot:
         self._stop_event = threading.Event()
         self._server: Optional[_ThreadingTCPServer] = None
         self._run_thread: Optional[threading.Thread] = None
+        self.retry_max_attempts = max(
+            0, _env_int("WECHATROBOT_DISPATCH_RETRY_TIMES", 3)
+        )
+        self.retry_base_seconds = max(
+            0.1,
+            _env_float("WECHATROBOT_DISPATCH_RETRY_BASE_SECONDS", 2.0),
+        )
+        self._retry_queue = deque()
+        self._login_state: Optional[bool] = None
 
     def on(self, *event_type: str) -> Callable:
         def deco(func: Callable) -> Callable:
@@ -272,6 +294,7 @@ class WeChatRobot:
                 if not isinstance(deliveries, list) or len(deliveries) != len(messages):
                     raise ValueError("bridge response deliveries must align with messages")
         except (requests.RequestException, ValueError, TypeError) as exc:
+            self.api.invalidate_db_handles()
             if log_failure:
                 logger.warning("Bridge pull failed: %s", exc)
             return False
@@ -281,10 +304,7 @@ class WeChatRobot:
                 if not isinstance(msg, dict):
                     logger.warning("Ignored non-object bridge message")
                     continue
-                try:
-                    self._receive_callback(msg)
-                except Exception:
-                    logger.exception("Bridge message dispatch failed")
+                self._dispatch_with_retry(msg)
             return True
 
         ack_ids = []
@@ -312,6 +332,7 @@ class WeChatRobot:
                         self.receipt_store.record_processed(dedup_key)
                 ack_ids.append(delivery_id)
             except Exception as exc:
+                self.api.invalidate_db_handles()
                 logger.exception("Bridge message dispatch failed")
                 nack_ids.append(delivery_id)
                 failure_reason = type(exc).__name__
@@ -323,6 +344,68 @@ class WeChatRobot:
             reason=locals().get("failure_reason", "dispatch failed"),
         )
         return ack_ok and nack_ok
+
+    def _native_logged_in(self) -> bool:
+        try:
+            data = self.api.GetSelfInfo().get("data")
+            ready = isinstance(data, dict) and bool(data.get("wxId"))
+        except Exception:
+            ready = False
+        if ready != self._login_state:
+            self._login_state = ready
+            if ready:
+                logger.info("Native WeChat login state changed: ready=True")
+            else:
+                logger.warning("Native WeChat login state changed: ready=False")
+        return ready
+
+    def _dispatch_with_retry(self, msg: Dict[str, Any], attempts: int = 0) -> None:
+        try:
+            self._receive_callback(msg)
+            return
+        except Exception as exc:
+            self.api.invalidate_db_handles()
+            next_attempts = attempts + 1
+            if not self._native_logged_in():
+                delay = min(
+                    60.0,
+                    self.retry_base_seconds * (2 ** min(next_attempts, 5)),
+                )
+                self._retry_queue.append(
+                    (msg, next_attempts, time.monotonic() + delay)
+                )
+                logger.warning(
+                    "Bridge message deferred until login, retry_in=%.1fs: %s",
+                    delay,
+                    exc,
+                )
+                return
+            if self.retry_max_attempts <= 0 or next_attempts > self.retry_max_attempts:
+                logger.error(
+                    "Bridge message dispatch failed permanently, attempts=%s: %s",
+                    next_attempts,
+                    exc,
+                )
+                return
+            delay = self.retry_base_seconds * (2 ** (next_attempts - 1))
+            self._retry_queue.append(
+                (msg, next_attempts, time.monotonic() + delay)
+            )
+            logger.warning(
+                "Bridge message dispatch failed, retry %s/%s in %.1fs: %s",
+                next_attempts,
+                self.retry_max_attempts,
+                delay,
+                exc,
+            )
+
+    def _process_retry_queue(self) -> None:
+        while self._retry_queue:
+            msg, attempts, due_at = self._retry_queue[0]
+            if time.monotonic() < due_at:
+                return
+            self._retry_queue.popleft()
+            self._dispatch_with_retry(msg, attempts)
 
     def _select_message_mode(self) -> str:
         if self.configured_message_mode != "auto":
@@ -343,6 +426,10 @@ class WeChatRobot:
     def _consume_forever(self) -> None:
         retry_delay = 1
         while not self._stop_event.is_set():
+            if not self._native_logged_in():
+                self._stop_event.wait(max(1.0, self.pull_wait_ms / 1000))
+                continue
+            self._process_retry_queue()
             if self._pull_once():
                 retry_delay = 1
                 continue
@@ -426,6 +513,7 @@ class WeChatRobot:
         ):
             run_thread.join(timeout=5)
         self._run_thread = None
+        self._retry_queue.clear()
         if self.receipt_store is not None:
             self.receipt_store.close()
             self.receipt_store = None
