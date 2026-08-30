@@ -28,11 +28,34 @@ class ApiFeatureTest(unittest.TestCase):
             "post",
             return_value=FakeResponse({"result": "OK"}),
         ) as post:
+            post.assert_not_called()
             response = api.MarkAsRead(wxid="wxid_a")
 
         self.assertEqual(response, {"result": "OK"})
         self.assertTrue(post.call_args.args[0].endswith("/api/?type=49"))
         self.assertEqual(json.loads(post.call_args.kwargs["data"]), {"wxid": "wxid_a"})
+
+    def test_send_quote_text_posts_type_51_only_when_explicitly_called(self):
+        api = Api()
+        with patch.object(
+            api_module.requests,
+            "post",
+            return_value=FakeResponse({"result": "OK"}),
+        ) as post:
+            post.assert_not_called()
+            response = api.SendQuoteText(
+                wxid="wxid_a",
+                msg="reply",
+                target_msgid="123456",
+            )
+
+        self.assertEqual(response, {"result": "OK"})
+        self.assertTrue(post.call_args.args[0].endswith("/api/?type=51"))
+        self.assertEqual(
+            json.loads(post.call_args.kwargs["data"]),
+            {"wxid": "wxid_a", "msg": "reply", "target_msgid": "123456"},
+        )
+        self.assertEqual(post.call_args.kwargs["timeout"], 60.0)
 
     def test_control_and_send_requests_use_separate_timeouts(self):
         api = Api()
