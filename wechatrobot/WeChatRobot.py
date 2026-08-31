@@ -46,7 +46,6 @@ MESSAGE_TYPES = {
     10002: "other",
 }
 
-
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     value = os.environ.get(name)
     if value is None:
@@ -211,9 +210,26 @@ class WeChatRobot:
             return func
         return deco
 
-    def _receive_callback(self, msg: Dict[str, Any]):
-        raw_type = msg.get("type")
-        msg["type"] = MESSAGE_TYPES.get(raw_type, "unhandled{}".format(raw_type))
+    @staticmethod
+    def normalize_message(msg: Dict[str, Any]) -> Dict[str, Any]:
+        message = dict(msg)
+        raw_type = message.get("type")
+        try:
+            raw_type = int(raw_type)
+        except (TypeError, ValueError):
+            return message
+        message["type"] = MESSAGE_TYPES.get(raw_type, "unhandled{}".format(raw_type))
+        return message
+
+    def GetChatMsgBySvrId(self, **params) -> Dict[str, Any]:
+        response = self.api.GetChatMsgBySvrId(**params)
+        if isinstance(response, dict) and isinstance(response.get("data"), dict):
+            response = dict(response)
+            response["data"] = self.normalize_message(response["data"])
+        return response
+
+    def _receive_callback(self, msg: Dict[str, Any]) -> None:
+        msg = self.normalize_message(msg)
 
         message = str(msg.get("message") or "")
         sender = str(msg.get("sender") or "")
