@@ -71,6 +71,9 @@ class Api:
     def SendQuoteText(self , **params) -> Dict:
         return self.post(WECHAT_MSG_SEND_QUOTE_TEXT , SendQuoteTextBody(**params), timeout=self.send_timeout)
 
+    def GetChatMsgBySvrId(self, **params) -> Dict:
+        return self.post(WECHAT_MSG_GET_BY_SVR_ID, GetChatMsgBySvrIdBody(**params))
+
     def SendAt(self , **params) -> Dict:
         return self.post(WECHAT_MSG_SEND_AT , SendAtBody(**params), timeout=self.send_timeout)
 

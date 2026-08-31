@@ -71,6 +71,7 @@ WECHAT_GET_CDN = 47                         # 下载文件、视频、图片
 WECHAT_DATABASE_INVALIDATE_HANDLES = 48     # 清空原生数据库句柄缓存
 WECHAT_MSG_MARK_AS_READ = 49                # 标记会话已读
 WECHAT_MSG_SEND_QUOTE_TEXT = 51             # 原生引用回复
+WECHAT_MSG_GET_BY_SVR_ID = 52                # 按服务器消息 ID 查询原始 XML
 
 # Body
 
@@ -94,6 +95,9 @@ class SendQuoteTextBody(Body):
     wxid         : str
     msg          : str
     target_msgid : str
+
+class GetChatMsgBySvrIdBody(Body):
+    msgid : str
 
 class SendAtBody(Body):
     chatroom_id  : str
