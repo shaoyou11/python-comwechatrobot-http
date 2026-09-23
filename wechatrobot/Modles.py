@@ -1,4 +1,4 @@
-from pydantic.v1 import BaseModel
+from pydantic.v1 import BaseModel, validator
 
 # login check
 WECHAT_IS_LOGIN = 0                         # 登录检查
@@ -285,4 +285,12 @@ class SendEmotionBody(Body):
 
 #get cdn
 class GetCdnBody(Body):
-    msgid : int
+    msgid: str
+
+    @validator("msgid")
+    def validate_server_message_id(cls, value):
+        # The installed 3.7 native API supports numeric server IDs, not local: refs.
+        if (not value or len(value) > 20 or not value.isascii()
+                or not value.isdecimal() or int(value) > 2 ** 64 - 1):
+            raise ValueError("GetCdn requires an unsigned 64-bit server message ID")
+        return value
